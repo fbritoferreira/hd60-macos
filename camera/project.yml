@@ -1,0 +1,75 @@
+# XcodeGen spec for the HD60 camera extension and its host app.
+#   cd camera && DEVELOPMENT_TEAM=<your team id> xcodegen && open HD60Camera.xcodeproj
+# or use ../Makefile: make camera DEVELOPMENT_TEAM=<id>
+name: HD60Camera
+options:
+  bundleIdPrefix: com.fbritoferreira
+  deploymentTarget:
+    macOS: "13.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  HD60Camera:
+    type: application
+    platform: macOS
+    sources: [App]
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: HD60 Camera
+        LSApplicationCategoryType: public.app-category.video
+        NSHumanReadableCopyright: MIT License
+    entitlements:
+      path: App/App.entitlements
+      properties:
+        com.apple.developer.system-extension.install: true
+        com.apple.security.application-groups:
+          - $(TeamIdentifierPrefix)com.fbritoferreira.hd60camera
+    dependencies:
+      - target: HD60CameraExtension
+  HD60CameraExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - Extension
+      - path: ../src/device.c
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.fbritoferreira.hd60camera.extension
+        PRODUCT_NAME: com.fbritoferreira.hd60camera.extension
+        SWIFT_OBJC_BRIDGING_HEADER: Extension/Bridging.h
+        HEADER_SEARCH_PATHS: ["$(SRCROOT)/../src", "/opt/homebrew/include/libusb-1.0"]
+        OTHER_LDFLAGS: ["/opt/homebrew/lib/libusb-1.0.a", "-framework", "IOKit", "-framework", "Security"]
+        GCC_WARN_INHIBIT_ALL_WARNINGS: NO
+        OTHER_CFLAGS: ["-Wno-missing-field-initializers"]
+    info:
+      path: Extension/Info.plist
+      properties:
+        CFBundleDisplayName: HD60 Camera
+        NSSystemExtensionUsageDescription: Makes the Elgato Game Capture HD60 available as a camera.
+        CMIOExtension:
+          CMIOExtensionMachServiceName: $(TeamIdentifierPrefix)com.fbritoferreira.hd60camera.service
+    entitlements:
+      path: Extension/Extension.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.device.usb: true
+        com.apple.security.application-groups:
+          - $(TeamIdentifierPrefix)com.fbritoferreira.hd60camera
+    preBuildScripts:
+      - name: Bundle firmware
+        basedOnDependencyAnalysis: false
+        script: |
+          fw="$SRCROOT/../firmware/hd60-bridge.bin"
+          if [ ! -f "$fw" ]; then
+            echo "error: $fw missing; run tools/extract-firmware.py first" >&2
+            exit 1
+          fi
+          mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          cp "$fw" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/hd60-bridge.bin"

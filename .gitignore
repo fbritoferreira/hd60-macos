@@ -2,3 +2,7 @@ hd60
 firmware/*.bin
 traces/
 *.dylib
+obs-plugin/deps/
+obs-plugin/build/
+camera/build/
+camera/HD60Camera.xcodeproj/
