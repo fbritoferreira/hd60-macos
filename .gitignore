@@ -1,0 +1,4 @@
+hd60
+firmware/*.bin
+traces/
+*.dylib
