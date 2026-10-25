@@ -13,10 +13,11 @@ It talks to the card through libusb. It needs no kernel extension, no Rosetta, a
 | Cold boot (firmware upload) | Works |
 | HDMI input, 1080p60 | Works, tested with a PS5 |
 | Stream out to stdout or UDP | Works |
-| Other input resolutions | Untested; the init sequence was recorded at 1080p60 |
-| HDCP-protected sources | Black picture; turn HDCP off on the console |
-| Shows up as a camera in OBS | Not yet; use a Media Source (below) |
-| Survives unplug or replug | No; restart `hd60` |
+| Output modes | 1080p60, 720p60 and 1080p30 (scaled on the card), plus bitrate control |
+| OBS source plugin | Works; video and audio in-process |
+| Clean shutdown, reconnect after unplug | Works |
+| HDCP-protected sources | Black picture; turn HDCP off on the console (see below for PS3) |
+| Camera extension for other apps | Builds, untested: needs a paid Apple developer team to sign |
 
 Only the original HD60 is supported. The HD60 S, HD60 S+, HD60 X and HD60 Pro are different hardware, and the S+ and X are already plug-and-play (UVC) on macOS.
 
@@ -59,9 +60,37 @@ Quit Elgato Game Capture HD first, because only one program can hold the card.
 ./hd60 -u 127.0.0.1:5000
 ```
 
-Options: `-f <path>` sets the firmware file (default `firmware/hd60-bridge.bin`), `-u ip:port` sends UDP instead of stdout, and `-v` prints progress. Stop it with Ctrl+C.
+Options:
 
-### OBS
+| Option | Meaning |
+|---|---|
+| `-m 1080p60\|720p60\|1080p30` | output mode, scaled by the card's hardware (default 1080p60) |
+| `-b <kbps>` | average bitrate, up to 40000 (default about 40000 at 1080p60) |
+| `-u ip:port` | send MPEG-TS over UDP instead of stdout |
+| `-f <path>` | firmware file (default `firmware/hd60-bridge.bin`) |
+| `-v` | print progress |
+
+`hd60` waits for the card if it isn't plugged in and reconnects after an unplug. Stop it with Ctrl+C, which also shuts the card down cleanly.
+
+### OBS plugin (recommended)
+
+The plugin runs the driver inside OBS and decodes with OBS's own FFmpeg, so you get video and audio with no helper process and the lowest latency. It builds against your installed OBS. Tested with OBS 32.2.2, which bundles FFmpeg 8.1:
+
+```sh
+brew install simde
+mkdir -p obs-plugin/deps && cd obs-plugin/deps
+git clone --depth 1 --branch 32.2.2 --filter=blob:none --sparse https://github.com/obsproject/obs-studio.git
+git -C obs-studio sparse-checkout set libobs
+git clone --depth 1 --branch n8.1 --filter=blob:none --sparse https://github.com/FFmpeg/FFmpeg.git ffmpeg
+git -C ffmpeg sparse-checkout set libavcodec libavformat libavutil libswresample
+cd ../.. && make install-obs-plugin   # copies the plugin and your firmware into OBS's plugin folder
+```
+
+Match the OBS tag to your OBS version, and the FFmpeg tag to the libavcodec major version OBS ships (`otool -L /Applications/OBS.app/Contents/Frameworks/libavcodec.dylib`).
+
+Restart OBS, then go to **Sources → + → Elgato HD60**. The source properties pick the output mode and bitrate. Quit any standalone `hd60` first, because only one program can hold the card.
+
+### OBS without the plugin
 
 1. Start `./hd60 -u 127.0.0.1:5000`.
 2. In OBS, add a **Media Source** with these settings:
@@ -78,6 +107,8 @@ Audio is carried in the stream, so the Media Source plays it too.
 ### Black picture?
 
 If the picture is black, the source is sending HDCP-protected video. On a PS5 go to *Settings › System › HDMI* and turn off *Enable HDCP*. On a PS4 it's *Settings › System › Enable HDCP*.
+
+**PS3:** the PS3 always enables HDCP on HDMI and has no setting to turn it off. This project doesn't and won't bypass HDCP. The PS3 does send games without HDCP over **component video**, though: connect a PS3 component AV cable to a component-to-HDMI converter, and the converter's HDMI output to the HD60. Then on the PS3 choose *Settings › Display Settings › Video Output Settings › Component / D-Terminal*, at 720p or 1080i.
 
 ### Latency
 
@@ -107,7 +138,27 @@ The HD60 is a USB 2.0 device with one vendor-specific interface:
 
 The I²C devices are at 8-bit addresses `0x66`, `0x9c`, `0x98`, `0x64` and `0x02`. The first three are the same devices the [elgato-gchd](https://github.com/tolga9009/elgato-gchd) project reaches through the original Game Capture HD's "mail" ports `0x33`, `0x4e` and `0x4c`, and the payloads match byte for byte. For example, `0x9c` takes `{reg, value ^ 0xcc}`-style pairs identical to gchd's `configure_hdmi.cpp`, and `0x66` takes gchd's 3-byte `99 89 ed` and `99 89 ec` register accesses. gchd's notes on those registers apply here.
 
-**Init.** `src/init_seq.h` is the 2,292-step configuration sequence that Elgato's app performs after boot. `tools/gen-replay.py` generated it from a USB trace. Status polls are folded into ready-waits, and register polls into mask/expect loops. The driver replays it and then reads EP `0x82`.
+**Init.** `src/init_seq.h` holds one startup sequence per output mode, plus a shutdown sequence. Each is about 2,300 steps. `tools/gen-replay.py` generated them from USB traces of Elgato's app: status polls are folded into ready-waits, and register polls into mask/expect loops. The driver replays the chosen sequence, then reads EP `0x82`. On stop it replays the shutdown sequence and runs the processor-off handshake from gchd: write `ab a9 0f a4 55` until the read-back is `33 44 55`.
+
+Status `0x06` isn't a hard gate. Elgato's app waits at most about 100 ms for it and then proceeds, and the driver does the same.
+
+**Encoder parameters.** The H.264 encoder takes 80 writes to I²C `0x66` of the form `a9 83 <addr16> <value32>`. The value is scrambled: bytes 4–5 are the high 16 bits (little-endian) XOR `e1 fe`, and bytes 6–7 are the low 16 bits XOR `c7 3a`. `tools/decode-params.py` decodes a trace. The registers identified so far:
+
+| Register (raw) | Meaning | 1080p60 value |
+|---|---|---|
+| `597b` | width in 16-px macroblocks | 120 |
+| `5f7b` | height in macroblocks | 68 |
+| `4d7b` | bottom crop in pixels | 8 |
+| `d77a` | GOP length | 12 (6 at 30 fps) |
+| `5d7b` | frame-rate divisor | 1001 |
+| `f37a` | average bitrate, kbps | 39997 |
+| `fd7a` / `d97a` | max / secondary max bitrate, kbps (2× / 1.8× average, capped at 40000) | 40000 |
+| `db7a` | min bitrate, kbps (0.7× average) | 27997 |
+| `fd7e` | peak bitrate, kbps (2.2× average, capped at 43501) | 43501 |
+| `f97e` idx `0b` | 1 = fixed IBBP GOP, 0 = adaptive B-frame placement | 1 |
+| `f17a` idx `29` | GOP structure (5 normally; 1 wedges the encoder until a replug) | 5 |
+
+Some registers take several writes, with an index in the top byte of the value. `tools/try-param.sh <n> <value>` patches one write and reports the resulting stream. Careful: a bad value can wedge the encoder until the card is unplugged.
 
 ## Tools
 
@@ -120,16 +171,29 @@ The I²C devices are at 8-bit addresses `0x66`, `0x9c`, `0x98`, `0x64` and `0x02
   ```
 
   This writes `trace.log` plus `pipe<N>.bin`, the raw stream data.
-- `tools/gen-replay.py` converts a cold-boot `trace.log` into `src/init_seq.h`.
+- `tools/gen-replay.py` converts traces into `src/init_seq.h` (see its docstring).
+- `tools/trace-variants.sh` traces Game Capture HD once per encoder setting, and `tools/diff-traces.py` diffs the resulting I²C writes.
+- `tools/decode-params.py` decodes the encoder parameter block, and `tools/try-param.sh` experiments with single parameters.
 - `tools/extract-firmware.py` extracts the firmware, as described above.
 
 Traces from other resolutions, inputs or settings would help: they're how the init sequence gets turned into real, parameterised configuration. Unplug and replug the card before tracing so the trace starts from a cold boot. Traces contain whatever was on screen, so check them before sharing.
 
+### Camera extension (untested)
+
+`camera/` contains a CoreMediaIO camera extension and host app, built with XcodeGen, that would expose the card as "HD60 Camera" (1080p60, video only) to every app. It builds, but macOS only loads system extensions signed by a **paid** Apple developer team, so it hasn't been run yet. With a paid team:
+
+```sh
+cd camera && DEVELOPMENT_TEAM=<team id> xcodegen
+xcodebuild -project HD60Camera.xcodeproj -scheme HD60Camera -configuration Release -allowProvisioningUpdates
+```
+
+Copy `HD60Camera.app` to `/Applications`, open it and click Install. Reports welcome.
+
 ## Roadmap
 
-- Decode the register writes into named settings, covering resolution, bitrate and B-frames, instead of a fixed replay
-- A CoreMediaIO camera extension, so the card shows up as a normal camera in OBS, FaceTime and other apps
-- Recovering from hot-plug and reconnecting automatically
+- Find the B-frame setting (a "no B-frames" mode would cut a few frames of latency)
+- 720p30 and other input resolutions (needs traces)
+- Test the camera extension with a paid developer team
 
 ## Credits
 
