@@ -42,14 +42,22 @@ static int ctrl_out(uint8_t req, uint16_t wv, uint16_t wi, const uint8_t *buf, u
 	return libusb_control_transfer(h, 0x40, req, wv, wi, (uint8_t *)buf, len, TIMEOUT);
 }
 
+// Status 00 01 = I2C engine idle. Game Capture HD waits at most ~100 ms and then proceeds anyway
+// (during shutdown the flag never comes back), so do the same; only many timeouts in a row
+// mean the card is wedged.
+static int ready_timeouts;
+
 static void wait_ready(void) {
 	uint8_t b[2];
-	for (int i = 0; i < 10000; i++) {
+	for (int i = 0; i < 2500; i++) { // ~250 ms at ~0.1 ms per request
 		int r = ctrl_in(REQ_STATUS, 0, 0, b, 2);
 		if (r < 0) die("status", r);
-		if (b[1] & 1) return;
+		if (b[1] & 1) {
+			ready_timeouts = 0;
+			return;
+		}
 	}
-	die("I2C engine never became ready", 0);
+	if (++ready_timeouts > 20) die("I2C engine stuck busy", 0);
 }
 
 static void i2c_write(uint8_t addr, const uint8_t *p, uint8_t n) {
@@ -100,11 +108,10 @@ static void load_firmware(const char *path, int verbose) {
 	if (verbose) fprintf(stderr, "hd60: loaded %d firmware records\n", count);
 }
 
-static void run_init(volatile int *stop, int verbose) {
+static void run_seq(const struct hd60_op *seq, size_t n, volatile int *stop, int verbose) {
 	uint8_t buf[64];
-	size_t n = sizeof hd60_init_seq / sizeof hd60_init_seq[0];
-	for (size_t i = 0; i < n && !*stop; i++) {
-		const struct hd60_op *op = &hd60_init_seq[i];
+	for (size_t i = 0; i < n && !(stop && *stop); i++) {
+		const struct hd60_op *op = &seq[i];
 		int r;
 		cur_op = (long)i;
 		switch (op->kind) {
@@ -131,8 +138,30 @@ static void run_init(volatile int *stop, int verbose) {
 			if (r < 0) die("control in", r);
 			break;
 		}
-		if (verbose && i % 500 == 0) fprintf(stderr, "hd60: init %zu/%zu\n", i, n);
+		if (verbose && i % 500 == 0) fprintf(stderr, "hd60: step %zu/%zu\n", i, n);
 	}
+}
+
+// Clean shutdown, as Game Capture HD does on quit: stop the encoder, power down the HDMI
+// receiver, then the processor handshake from elgato-gchd (ab a9 0f a4 55 reads 33 44 55 once
+// the processor is off). Skipping this can leave the card needing a replug.
+static void shutdown_card(int verbose) {
+	cur_op = -1;
+	run_seq(hd60_stop_seq, sizeof hd60_stop_seq / sizeof hd60_stop_seq[0], NULL, 0);
+	static const uint8_t probe[] = {0xab, 0xa9, 0x0f, 0xa4, 0x55};
+	static const uint8_t off[] = {0x0c, 0x0b, 0x80};
+	uint8_t r[3];
+	for (int i = 0; i < 50; i++) {
+		i2c_write(0x66, probe, sizeof probe);
+		i2c_read(0x66, r, 3);
+		ctrl_out(0x0c, 0, 0, off, sizeof off);
+		if (r[0] == 0x33 && r[1] == 0x44 && r[2] == 0x55) {
+			if (verbose) fprintf(stderr, "hd60: card shut down\n");
+			return;
+		}
+		usleep(100000);
+	}
+	if (verbose) fprintf(stderr, "hd60: shutdown handshake did not complete\n");
 }
 
 struct stream_state {
@@ -186,6 +215,7 @@ int hd60_run(const char *firmware, hd60_data_cb cb, void *ctx, volatile int *sto
 	if (!h) return HD60_ERR_NOT_FOUND;
 	int ret = 0;
 	fail_firmware = 0;
+	ready_timeouts = 0;
 	cur_op = -1;
 	if (setjmp(fail)) {
 		if (verbose)
@@ -197,13 +227,15 @@ int hd60_run(const char *firmware, hd60_data_cb cb, void *ctx, volatile int *sto
 	int r = libusb_claim_interface(h, 0);
 	if (r) die("claim interface (is another app using the HD60?)", r);
 	if (!booted()) load_firmware(firmware, verbose);
-	run_init(stop, verbose);
+	run_seq(hd60_init_seq, sizeof hd60_init_seq / sizeof hd60_init_seq[0], stop, verbose);
+	cur_op = -1;
 	if (!*stop) {
 		struct stream_state s = {cb, ctx, 0, 0, stop};
 		if (verbose) fprintf(stderr, "hd60: streaming\n");
 		stream(&s);
 		if (s.lost) ret = HD60_ERR_DEVICE;
 	}
+	if (ret == 0) shutdown_card(verbose);
 	libusb_release_interface(h, 0);
 out:
 	libusb_close(h);
