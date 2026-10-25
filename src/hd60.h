@@ -25,3 +25,9 @@ struct hd60_op {
 	uint16_t wIndex;  // CTRL_*
 	uint8_t expect;   // POLL: wanted value of (read & mask)
 };
+
+struct hd60_mode {
+	const char *name;
+	const struct hd60_op *seq;
+	unsigned long len;
+};

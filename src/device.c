@@ -108,6 +108,35 @@ static void load_firmware(const char *path, int verbose) {
 	if (verbose) fprintf(stderr, "hd60: loaded %d firmware records\n", count);
 }
 
+// Encoder parameter writes (I2C 0x66): a9 83 <addr16> <value32>, value scrambled as
+// bytes 4-5 = hi16 LE ^ e1 fe, bytes 6-7 = lo16 LE ^ c7 3a. See tools/decode-params.py.
+static void param_encode(uint8_t *d, uint32_t v) {
+	d[4] = (v >> 16 & 0xff) ^ 0xe1;
+	d[5] = (v >> 24) ^ 0xfe;
+	d[6] = (v & 0xff) ^ 0xc7;
+	d[7] = (v >> 8 & 0xff) ^ 0x3a;
+}
+
+static int bitrate_kbps;
+
+// Rate-control registers and how Game Capture HD derives them from the average bitrate A
+// (measured at A = 39997 and 10666 kbps): max = min(2A, 40000), mid = min(1.8A, 40000),
+// min = 0.7A, peak = min(2.2A, 43501).
+static int bitrate_param(const uint8_t *d, uint32_t *v) {
+	if (!bitrate_kbps || d[0] != 0xa9 || d[1] != 0x83) return 0;
+	uint32_t a = bitrate_kbps;
+	uint16_t reg = d[2] << 8 | d[3];
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+	switch (reg) {
+	case 0xfd7a: *v = MIN(2 * a, 40000); return 1;
+	case 0xf37a: *v = a; return 1;
+	case 0xdb7a: *v = a * 7 / 10; return 1;
+	case 0xd97a: *v = MIN(a * 18 / 10, 40000); return 1;
+	case 0xfd7e: *v = MIN(a * 22 / 10, 43501); return 1;
+	}
+	return 0;
+}
+
 static void run_seq(const struct hd60_op *seq, size_t n, volatile int *stop, int verbose) {
 	uint8_t buf[64];
 	for (size_t i = 0; i < n && !(stop && *stop); i++) {
@@ -115,9 +144,18 @@ static void run_seq(const struct hd60_op *seq, size_t n, volatile int *stop, int
 		int r;
 		cur_op = (long)i;
 		switch (op->kind) {
-		case OP_I2C_W:
-			i2c_write(op->a, op->data, op->len);
+		case OP_I2C_W: {
+			uint32_t v;
+			if (op->a == 0x66 && op->len == 8 && bitrate_param(op->data, &v)) {
+				uint8_t d[8];
+				memcpy(d, op->data, 8);
+				param_encode(d, v);
+				i2c_write(op->a, d, 8);
+			} else {
+				i2c_write(op->a, op->data, op->len);
+			}
 			break;
+		}
 		case OP_I2C_R:
 			i2c_read(op->a, buf, op->len);
 			break;
@@ -204,7 +242,23 @@ static void stream(struct stream_state *s) {
 	}
 }
 
-int hd60_run(const char *firmware, hd60_data_cb cb, void *ctx, volatile int *stop, int verbose) {
+const char *const *hd60_mode_names(void) {
+	static const char *names[sizeof hd60_modes / sizeof hd60_modes[0] + 1];
+	for (size_t i = 0; i < sizeof hd60_modes / sizeof hd60_modes[0]; i++) names[i] = hd60_modes[i].name;
+	return names;
+}
+
+int hd60_run(const struct hd60_config *cfg, hd60_data_cb cb, void *ctx, volatile int *stop) {
+	int verbose = cfg->verbose;
+	const struct hd60_mode *mode = &hd60_modes[0];
+	if (cfg->mode) {
+		mode = NULL;
+		for (size_t i = 0; i < sizeof hd60_modes / sizeof hd60_modes[0]; i++)
+			if (!strcmp(cfg->mode, hd60_modes[i].name)) mode = &hd60_modes[i];
+		if (!mode) return HD60_ERR_CONFIG;
+	}
+	if (cfg->bitrate_kbps < 0 || cfg->bitrate_kbps > 40000) return HD60_ERR_CONFIG;
+	bitrate_kbps = cfg->bitrate_kbps;
 	static int inited;
 	if (!inited) {
 		int r = libusb_init(NULL);
@@ -226,8 +280,8 @@ int hd60_run(const char *firmware, hd60_data_cb cb, void *ctx, volatile int *sto
 	}
 	int r = libusb_claim_interface(h, 0);
 	if (r) die("claim interface (is another app using the HD60?)", r);
-	if (!booted()) load_firmware(firmware, verbose);
-	run_seq(hd60_init_seq, sizeof hd60_init_seq / sizeof hd60_init_seq[0], stop, verbose);
+	if (!booted()) load_firmware(cfg->firmware, verbose);
+	run_seq(mode->seq, mode->len, stop, verbose);
 	cur_op = -1;
 	if (!*stop) {
 		struct stream_state s = {cb, ctx, 0, 0, stop};

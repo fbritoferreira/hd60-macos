@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 static volatile int stop;
@@ -36,11 +37,13 @@ static void on_signal(int s) {
 }
 
 int main(int argc, char **argv) {
-	const char *fw = "firmware/hd60-bridge.bin";
-	int verbose = 0, c;
-	while ((c = getopt(argc, argv, "f:u:v")) != -1) {
-		if (c == 'f') fw = optarg;
-		else if (c == 'v') verbose = 1;
+	struct hd60_config cfg = {.firmware = "firmware/hd60-bridge.bin"};
+	int c;
+	while ((c = getopt(argc, argv, "f:m:b:u:v")) != -1) {
+		if (c == 'f') cfg.firmware = optarg;
+		else if (c == 'm') cfg.mode = optarg;
+		else if (c == 'b') cfg.bitrate_kbps = atoi(optarg);
+		else if (c == 'v') cfg.verbose = 1;
 		else if (c == 'u') {
 			char host[64];
 			int port;
@@ -52,7 +55,10 @@ int main(int argc, char **argv) {
 			udp_to.sin_port = htons(port);
 			udp = socket(AF_INET, SOCK_DGRAM, 0);
 		} else {
-			fprintf(stderr, "usage: hd60 [-v] [-f firmware.bin] [-u ip:port | > out.ts]\n");
+			fprintf(stderr, "usage: hd60 [-v] [-f firmware.bin] [-m mode] [-b kbps] [-u ip:port | > out.ts]\n");
+			fprintf(stderr, "modes:");
+			for (const char *const *m = hd60_mode_names(); *m; m++) fprintf(stderr, " %s", *m);
+			fprintf(stderr, "\nbitrate: average kbps, up to 40000 (default: Elgato's, ~40000)\n");
 			return 2;
 		}
 	}
@@ -66,10 +72,14 @@ int main(int argc, char **argv) {
 
 	int last = 1;
 	while (!stop) {
-		int r = hd60_run(fw, on_data, NULL, &stop, verbose);
+		int r = hd60_run(&cfg, on_data, NULL, &stop);
 		if (r == HD60_ERR_FIRMWARE) {
-			fprintf(stderr, "hd60: firmware %s missing or corrupt; run tools/extract-firmware.py\n", fw);
+			fprintf(stderr, "hd60: firmware %s missing or corrupt; run tools/extract-firmware.py\n", cfg.firmware);
 			return 1;
+		}
+		if (r == HD60_ERR_CONFIG) {
+			fprintf(stderr, "hd60: unknown mode or bitrate out of range (run hd60 -h)\n");
+			return 2;
 		}
 		if (stop) break;
 		if (r != last) {
